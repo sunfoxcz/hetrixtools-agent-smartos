@@ -218,13 +218,7 @@ SwapSize=$(swap -s | awk '{print $11}' | cut -d "k" -f 1)
 SwapFree=$(($(echo $SwapSize) - $(swap -s | awk '{print $9}' | cut -d "k" -f 1)))
 Swap=$(echo | awk "{ print 100 - (($SwapFree / $SwapSize) * 100) }")
 # Get all disks usage
-POOLs=$(zpool list -Ho name)
-DISKs=""
-for POOL in "$POOLs"
-do
-	DISKs="$DISKs$(zfs list -Hp $POOL | awk '{ print $(NF)","$2+$3","$2","$3";" }')"
-done
-DISKs=$(echo -ne $DISKs | gzip -cf | base64)
+DISKs=$(echo -ne $(df -k | awk '$1 ~ /\// {print}' | awk '{ print $(NF)","$2*1024","$3*1024","$4*1024";" }') | gzip -cf | base64)
 DISKs=$(base64prep "$DISKs")
 # Calculate Total Network Usage (bytes)
 RX=0
