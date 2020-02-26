@@ -24,7 +24,7 @@
 ##############
 
 # Set PATH
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/usr/bin:/usr/sbin:/smartdc/bin:/opt/smartdc/bin:/opt/local/bin:/opt/local/sbin:/opt/tools/bin:/opt/tools/sbin:/opt/smartdc/agents/bin
 ScriptPath=$(dirname "${BASH_SOURCE[0]}")
 
 # Agent Version (do not change)
@@ -79,23 +79,10 @@ function servicestatus() {
 	if (( $(ps -ef | grep -v grep | grep $1 | wc -l) > 0 ))
 	then
 		# Up
-		echo "$(echo -ne "$1" | base64),1"
+		echo "$(echo -ne "$1" | base64 | tr -d '[:space:]'),1"
 	else
-		# Down, try with systemctl (if available)
-		if command -v "systemctl" > /dev/null 2>&1
-		then
-			if $(systemctl is-active --quiet $1)
-			then
-				# Up
-				echo "$(echo -ne "$1" | base64),1"
-			else
-				# Down
-				echo "$(echo -ne "$1" | base64),0"
-			fi
-		else
-			# No systemctl, declare it down
-			echo "$(echo -ne "$1" | base64),0"
-		fi
+		# No systemctl, declare it down
+		echo "$(echo -ne "$1" | base64 | tr -d '[:space:]'),0"
 	fi
 }
 
@@ -138,10 +125,9 @@ then
 	IFS=',' read -r -a NetworkInterfacesArray <<< "$NetworkInterfaces"
 else
 	# Automatically detect the network interfaces
-	NetworkInterfacesArray=($(ip a | grep BROADCAST | grep 'state UP' | awk '{print $2}' | awk -F ":" '{print $1}' | awk -F "@" '{print $1}'))
+	NetworkInterfacesArray=($(ifconfig | grep BROADCAST | grep UP | awk '{print $1}' | awk -F ":" '{print $1}'))
 fi
 # Get the initial network usage
-T=$(cat /proc/net/dev)
 START=$(date +%s)
 declare -A aRX
 declare -A aTX
@@ -150,29 +136,28 @@ declare -A tTX
 # Loop through network interfaces
 for NIC in "${NetworkInterfacesArray[@]}"
 do
-	aRX[$NIC]=$(echo "$T" | grep -w "$NIC" | awk '{print $2}')
-	aTX[$NIC]=$(echo "$T" | grep -w "$NIC" | awk '{print $10}')
+	aRX[$NIC]=$(dlstat -rpo rbytes "$NIC")
+	aTX[$NIC]=$(dlstat -tpo obytes "$NIC")
 done
 
 # Collect data loop
 for X in $(seq $RunTimes)
 do
 	# Get vmstat info
-	VMSTAT=$(vmstat $CollectEveryXSeconds 2 | tail -1 )
+	VMSTAT=$(vmstat $CollectEveryXSeconds 2 | tail -1)
 	# Get CPU Load
-	CPU=$(echo $[100-$( echo "$VMSTAT" | awk '{print $15}')])
+	CPU=$(echo $[100-$( echo "$VMSTAT" | awk '{print $22}')])
 	tCPU=$(echo | awk "{ print $tCPU + $CPU }")
 	# Get IO Wait
-	IOW=$( echo "$VMSTAT" | awk '{print $16}')
+	IOW=$(iostat -xn $CollectEveryXSeconds 2 | grep zones | tail -1 | awk '{print $9}')
 	tIOW=$(echo | awk "{ print $tIOW + $IOW }")
 	# Get RAM Usage
-	aRAM=$( echo "$VMSTAT" | awk '{print $4 + $5 + $6}')
-	bRAM=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-	RAM=$(echo | awk "{ print $aRAM*100/$bRAM }")
-	RAM=$(echo | awk "{ print 100 - $RAM }")
-	tRAM=$(echo | awk "{ print $tRAM + $RAM }")
+	bRAM=$(prtconf | grep Memory | awk '{print $3 * 1024}')
+	aRAM=$(($bRAM - $(echo "$VMSTAT" | awk '{print $5}')))
+	RAM=$(echo | awk "{ print $aRAM*100/$bRAM }" | sed 's/,/./g')
+	RAM=$(echo | awk "{ print 100 - $RAM }" | sed 's/,/./g')
+	tRAM=$(echo | awk "{ print $tRAM + $RAM }" | sed 's/,/./g')
 	# Get Network Usage
-	T=$(cat /proc/net/dev)
 	END=$(date +%s)
 	TIMEDIFF=$(echo | awk "{ print $END - $START }")
 	START=$(date +%s)
@@ -180,17 +165,17 @@ do
 	for NIC in "${NetworkInterfacesArray[@]}"
 	do
 		# Received Traffic
-		RX=$(echo | awk "{ print $(echo "$T" | grep -w "$NIC" | awk '{print $2}') - ${aRX[$NIC]} }")
+		RX=$(echo | awk "{ print $(dlstat -rpo rbytes "$NIC") - ${aRX[$NIC]} }")
 		RX=$(echo | awk "{ print $RX / $TIMEDIFF }")
 		RX=$(echo "$RX" | awk {'printf "%18.0f",$1'} | xargs)
-		aRX[$NIC]=$(echo "$T" | grep -w "$NIC" | awk '{print $2}')
+		aRX[$NIC]=$(dlstat -rpo rbytes "$NIC")
 		tRX[$NIC]=$(echo | awk "{ print ${tRX[$NIC]} + $RX }")
 		tRX[$NIC]=$(echo "${tRX[$NIC]}" | awk {'printf "%18.0f",$1'} | xargs)
 		# Transferred Traffic
-		TX=$(echo | awk "{ print $(echo "$T" | grep -w "$NIC" | awk '{print $10}') - ${aTX[$NIC]} }")
+		TX=$(echo | awk "{ print $(dlstat -tpo obytes "$NIC") - ${aTX[$NIC]} }")
 		TX=$(echo | awk "{ print $TX / $TIMEDIFF }")
 		TX=$(echo "$TX" | awk {'printf "%18.0f",$1'} | xargs)
-		aTX[$NIC]=$(echo "$T" | grep -w "$NIC" | awk '{print $10}')
+		aTX[$NIC]=$(dlstat -tpo obytes "$NIC")
 		tTX[$NIC]=$(echo | awk "{ print ${tTX[$NIC]} + $TX }")
 		tTX[$NIC]=$(echo "${tTX[$NIC]}" | awk {'printf "%18.0f",$1'} | xargs)
 	done
@@ -200,67 +185,49 @@ do
 	then
 		MM=0
 	fi
-	if [ "$MM" -gt "$M" ] 
+	if [ "$MM" -gt "$M" ]
 	then
 		break
 	fi
 done
 
-# Check if system requires reboot
-RequiresReboot=0
-if [ -f  /var/run/reboot-required ]
-then
-	RequiresReboot=1
-fi
 # Get Operating System and Kernel
-# Check via lsb_release if possible
-if command -v "lsb_release" > /dev/null 2>&1
-then
-	OS=$(lsb_release -s -d)
-# Check if it's Debian
-elif [ -f /etc/debian_version ]
-then
-	OS="Debian $(cat /etc/debian_version)"
-# Check if it's CentOS/Fedora
-elif [ -f /etc/redhat-release ]
-then
-	OS=`cat /etc/redhat-release`
-	# Check if system requires reboot (Only supported in CentOS/RHEL 7 and later, with yum-utils installed)
-	if [ ! -z "$(needs-restarting -r | grep 'Reboot is required')" ]
-	then
-		RequiresReboot=1
-	fi
-# If all else fails, get Kernel name
-else
-	OS="$(uname -s) $(uname -r)"
-fi
-OS=$(echo -ne "$OS|$(uname -r)|$RequiresReboot" | base64)
+OS="$(uname -s) $(uname -r)"
+OS=`echo -ne "$OS|$(uname -v)|0" | base64 | tr -d '[:space:]'`
 # Get the server uptime
-Uptime=$(cat /proc/uptime | awk '{ print $1 }')
+Uptime=$(($(date +%s) - $(kstat -pn system_misc -s boot_time|cut -f 2)))
 # Get CPU model
-CPUModel=$(cat /proc/cpuinfo | grep -m1 'model name' | awk -F": " '{ print $2 }')
-CPUModel=$(echo -ne "$CPUModel" | base64)
+CPUModel=$(psrinfo -pv | tail -n 1)
+CPUModel=$(echo -ne "$CPUModel" | base64 | tr -d '[:space:]')
 # Get CPU speed (MHz)
-CPUSpeed=$(cat /proc/cpuinfo | grep -m1 'cpu MHz' | awk -F": " '{ print $2 }')
-CPUSpeed=$(echo -ne "$CPUSpeed" | base64)
+CPUSpeed=$(psrinfo -pv | grep clock | tail -n 1 | awk '{print $(NF-1)}')
+CPUSpeed=$(echo -ne "$CPUSpeed" | base64 | tr -d '[:space:]')
 # Get number of cores
-CPUCores=$(cat /proc/cpuinfo | grep processor | wc -l)
+CPUCores=$(psrinfo -t)
 # Calculate average CPU Usage
 CPU=$(echo | awk "{ print $tCPU / $X }")
 # Calculate IO Wait
 IOW=$(echo | awk "{ print $tIOW / $X }")
 # Get system memory (RAM)
-RAMSize=$(cat /proc/meminfo | grep ^MemTotal: | awk '{print $2}')
+RAMSize=$(prtconf | grep Memory | awk '{print $3 * 1024}')
 # Calculate RAM Usage
-RAM=$(echo | awk "{ print $tRAM / $X }")
+RAM=$(echo | awk "{ print $tRAM / $X }" | sed 's/,/./g')
 # Get the Swap Size
-SwapSize=$(cat /proc/meminfo | grep ^SwapTotal: | awk '{print $2}')
+SwapSize=$(swap -s | awk '{print $11}' | cut -d "k" -f 1)
 # Calculate Swap Usage
-SwapFree=$(cat /proc/meminfo | grep ^SwapFree: | awk '{print $2}')
-Swap=$(echo | awk "{ print 100 - (($SwapFree / $SwapSize) * 100) }")
+SwapFree=$(($(echo $SwapSize) - $(swap -s | awk '{print $9}' | cut -d "k" -f 1)))
+Swap=$(echo | awk "{ print 100 - (($SwapFree / $SwapSize) * 100) }" | sed 's/,/./g')
+
 # Get all disks usage
-DISKs=$(echo -ne $(df -PB1 | awk '$1 ~ /\// {print}' | awk '{ print $(NF)","$2","$3","$4";" }') | gzip -cf | base64)
+# DISKs=$(echo -ne $(df -k | awk '$1 ~ /\// {print}' | awk '{ print $(NF)","$2*1024","$3*1024","$4*1024";" }') | gzip -cf | base64 | tr -d '[:space:]')
+POOLs=$(zpool list -Ho name)
+for POOL in "$POOLs"
+do
+	DISKs="$DISKs$(zfs list -Hp $POOL | awk '{ print $(NF)","$2+$3","$2","$3";" }')"
+done
+DISKs=$(echo -ne $DISKs | gzip -cf | base64 | tr -d '[:space:]')
 DISKs=$(base64prep "$DISKs")
+
 # Calculate Total Network Usage (bytes)
 RX=0
 TX=0
@@ -274,7 +241,7 @@ do
 	TX=$(echo "$TX" | awk {'printf "%18.0f",$1'} | xargs)
 	NICS=$NICS"|"$NIC";"$RX";"$TX";"
 done
-NICS=$(echo -ne "$NICS" | gzip -cf | base64)
+NICS=$(echo -ne "$NICS" | gzip -cf | base64 | tr -d '[:space:]')
 NICS=$(base64prep "$NICS")
 # Check Services (if any are set to be checked)
 ServiceStatusString=""
@@ -286,6 +253,7 @@ then
 		ServiceStatusString="$ServiceStatusString"$(servicestatus "$i")";"
 	done
 fi
+
 # Check Software RAID
 RAID=""
 if [ "$CheckSoftRAID" -gt 0 ]
@@ -300,37 +268,22 @@ then
 		fi
 	done
 fi
-RAID=$(echo -ne "$RAID" | gzip -cf | base64)
+RAID=$(echo -ne "$RAID" | gzip -cf | base64 | tr -d '[:space:]')
 RAID=$(base64prep "$RAID")
+
 # Check Drive Health
 DH=""
 if [ "$CheckDriveHealth" -gt 0 ]
 then
 	if [ -x "$(command -v smartctl)" ] #Using S.M.A.R.T. (for regular HDD/SSD)
 	then
-		for i in $(lsblk -l | grep 'disk' | awk '{ print $1 }')
+		for i in $(diskinfo -cH | grep -v "\?\?R" | awk '{ print $2 }')
 		do
-			DHealth=$(smartctl -A /dev/$i)
+			DHealth=$(smartctl -A /dev/rdsk/$i)
 			if grep -q 'Attribute' <<< $DHealth
 			then
-				DHealth=$(smartctl -H /dev/$i)"\n$DHealth"
+				DHealth=$(smartctl -H /dev/rdsk/$i)"\n$DHealth"
 				DH="$DH|1\n$i\n$DHealth\n"
-			else # If initial read has failed, see if drives are behind hardware raid
-				MegaRaid=($(smartctl --scan | grep megaraid | awk '{ print $(3) }'))
-				if [ ${#MegaRaid[@]} -gt 0 ]
-				then
-					MegaRaidN=0
-					for MegaRaidID in "${MegaRaid[@]}"
-					do
-						DHealth=$(smartctl -A -d $MegaRaidID /dev/$i)
-						if grep -q 'Attribute' <<< $DHealth
-						then
-							MegaRaidN=$((MegaRaidN + 1))
-							DHealth=$(smartctl -H -d $MegaRaidID /dev/$i)"\n$DHealth"
-							DH="$DH|1\n$i[$MegaRaidN]\n$DHealth\n"
-						fi
-					done
-				fi
 			fi
 		done
 	fi
@@ -350,8 +303,9 @@ then
 		done
 	fi
 fi
-DH=$(echo -ne "$DH" | gzip -cf | base64)
+DH=$(echo -ne "$DH" | gzip -cf | base64 | tr -d '[:space:]')
 DH=$(base64prep "$DH")
+
 # Running Processes
 RPS1=""
 RPS2=""
@@ -361,7 +315,7 @@ then
 	RPS1=$(cat $ScriptPath/running_proc.txt)
 	# Get the current 'running processes' snapshot
 	RPS2=$(ps -Ao pid,ppid,uid,user:20,pcpu,pmem,cputime,etime,comm,cmd --no-headers)
-	RPS2=$(echo -ne "$RPS2" | gzip -cf | base64)
+	RPS2=$(echo -ne "$RPS2" | gzip -cf | base64 | tr -d '[:space:]')
 	RPS2=$(base64prep "$RPS2")
 	# Save the current snapshot for next run
 	echo $RPS2 > $ScriptPath/running_proc.txt
@@ -370,6 +324,7 @@ fi
 # Prepare data
 DATA="$OS|$Uptime|$CPUModel|$CPUSpeed|$CPUCores|$CPU|$IOW|$RAMSize|$RAM|$SwapSize|$Swap|$DISKs|$NICS|$ServiceStatusString|$RAID|$DH|$RPS1|$RPS2"
 POST="v=$VERSION&s=$SID&d=$DATA"
+
 # Save data to file
 echo $POST > $ScriptPath/hetrixtools_agent.log
 
