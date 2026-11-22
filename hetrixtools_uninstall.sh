@@ -19,68 +19,26 @@
 #
 #
 
-# Set PATH
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# Check if install script is run by root
-echo "Checking root privileges..."
-if [ "$EUID" -ne 0 ]
-  then echo "Please run the install script as root."
-  exit
+set -e
+PATH=/usr/bin:/usr/sbin:/opt/local/bin:/opt/local/sbin
+export LC_ALL=C
+umask 077
+if [[ "$EUID" != 0 || "$(uname -s)" != SunOS ]]; then
+	printf '%s\n' 'Run this script as root on SmartOS.' >&2
+	exit 1
 fi
-echo "... done."
 
-# Fetch Server Unique ID
-SID=$1
-
-# Remove old agent (if exists)
-echo "Checking if hetrixtools agent folder exists..."
-if [ -d /etc/hetrixtools ]
-then
-	echo "Old hetrixtools agent found, deleting it..."
-	rm -rf /etc/hetrixtools
-else
-	echo "No old hetrixtools agent folder found..."
-fi
-echo "... done."
-
-# Killing any running hetrixtools agents
-echo "Killing any hetrixtools agent scripts that may be currently running..."
-ps aux | grep -ie hetrixtools_agent.sh | awk '{print $2}' | xargs kill -9
-echo "... done."
-
-# Checking if hetrixtools user exists
-echo "Checking if hetrixtool user exists..."
-if id -u hetrixtools >/dev/null 2>&1
-then
-	echo "The hetrixtools user exists, killing its processes..."
-	pkill -9 -u `id -u hetrixtools`
-	echo "Deleting hetrixtools user..."
-	userdel hetrixtools
-else
-	echo "The hetrixtools user doesn't exist..."
-fi
-echo "... done."
-
-# Removing cronjob (if exists)
-echo "Removing any hetrixtools cronjob, if exists..."
-crontab -u root -l | grep -v 'hetrixtools_agent.sh'  | crontab -u root - >/dev/null 2>&1
-crontab -u hetrixtools -l | grep -v 'hetrixtools_agent.sh'  | crontab -u hetrixtools - >/dev/null 2>&1
-echo "... done."
-
-# Cleaning up uninstall file
-echo "Cleaning up the installation file..."
-if [ -f $0 ]
-then
-    rm -f $0
-fi
-echo "... done."
-
-# Let HetrixTools platform know uninstall has been completed
-echo "Letting HetrixTools platform know the uninstallation has been completed..."
-POST="v=uninstall&s=$SID"
-wget -t 1 -T 30 -qO- --post-data "$POST" --no-check-certificate https://sm.hetrixtools.net/ &> /dev/null
-echo "... done."
-
-# All done
-echo "HetrixTools agent uninstallation completed."
+agent=/etc/hetrixtools/hetrixtools_agent.sh
+[[ -f "$agent" ]] || exit 0
+cron_file=$(mktemp /var/tmp/hetrixtools-cron.XXXXXX)
+trap 'rm -f "$cron_file"' EXIT
+for account in root hetrixtools; do
+	id -u "$account" >/dev/null 2>&1 || continue
+	if existing=$(crontab -u "$account" -l 2>/dev/null) &&
+		grep -q '/etc/hetrixtools/hetrixtools_agent\.sh' <<< "$existing"; then
+		awk '!/\/etc\/hetrixtools\/hetrixtools_agent\.sh/' <<< "$existing" > "$cron_file"
+		crontab -u "$account" "$cron_file"
+	fi
+done
+rm -f "$agent"
+printf '%s\n' 'Removed the agent and its cron entry. Configuration and custom variables were retained.'

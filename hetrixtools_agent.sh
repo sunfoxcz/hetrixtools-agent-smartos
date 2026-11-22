@@ -2,7 +2,7 @@
 #
 #
 #	HetrixTools Server Monitoring Agent
-#	version 1.5.8
+#	SmartOS port, wire protocol 2.4.2
 #	Copyright 2015 - 2019 @  HetrixTools
 #	For support, please open a ticket on our website https://hetrixtools.com
 #
@@ -19,314 +19,311 @@
 #
 #
 
-##############
-## Settings ##
-##############
-
-# Set PATH
+# HetrixTools Server Monitoring Agent for SmartOS, protocol version 2.4.2.
 PATH=/usr/bin:/usr/sbin:/smartdc/bin:/opt/smartdc/bin:/opt/local/bin:/opt/local/sbin:/opt/tools/bin:/opt/tools/sbin:/opt/smartdc/agents/bin
-ScriptPath=$(dirname "${BASH_SOURCE[0]}")
-
-# Agent Version (do not change)
-VERSION="1.5.8"
-
-# SID (Server ID - automatically assigned on installation, do not change this)
-# DO NOT share this ID with anyone
-SID="SIDPLACEHOLDER"
-
-# How frequently should the data be collected (do not modify this, unless instructed to do so)
-CollectEveryXSeconds=3
-
-# Runtime, in seconds (do not modify this, unless instructed to do so)
-Runtime=60
-
-# Network Interfaces
-# * if you leave this setting empty our agent will detect and monitor all of your active network interfaces
-# * if you wish to monitor just one interface, fill its name down below (ie: "eth1")
-# * if you wish to monitor just some specific interfaces, fill their names below separated by comma (ie: "eth0,eth1,eth2")
+export LC_ALL=C
+umask 077
+ScriptPath=$(cd -P -- "$(dirname -- "$0")" && pwd) || exit 1
+StatePath="$ScriptPath/state"
+VERSION=2.4.2
+SID=""
 NetworkInterfaces=""
-
-# Check Services
-# * separate service names by comma (,) with a maximum of 10 services to be monitored (ie: "ssh,mysql,apache2,nginx")
-# * NOTE: this will only check if the service is running, not its functionality
 CheckServices=""
-
-# Check Software RAID Health
-# * checks the status/health of any software RAID (mdadm) setup on the server
-# * agent must be run as 'root' or privileged user to fetch the RAID status
-# * 0 - OFF (default) | 1 - ON
 CheckSoftRAID=0
-
-# Check Drive Health
-# * checks the health of any found drives on the system
-# * requirements: 'S.M.A.R.T.' for HDD/SSD or 'nvme-cli' for NVMe
-# * (these do not get installed by our agent, you must install them separately)
-# * agent must be run as 'root' or privileged user to use this function
-# * 0 - OFF (default) | 1 - ON
 CheckDriveHealth=0
-
-# View Running Processes
-# * whether or not to record the server's running processes and display them in your HetrixTools dashboard
-# * 0 - OFF (default) | 1 - ON
 RunningProcesses=0
+ConnectionPorts=""
+CollectEveryXSeconds=3
+CustomVars=custom_variables.json
 
-################################################
-## CAUTION: Do not edit any of the code below ##
-################################################
+# Accept data assignments only, including quoted values migrated from 1.5.8.
+while IFS='=' read -r key value || [[ -n "$key" ]]; do
+	case "$value" in \"*\") value=${value#\"}; value=${value%\"} ;; esac
+	case "$key" in
+		SID) SID=$value ;;
+		NetworkInterfaces) NetworkInterfaces=$value ;;
+		CheckServices) CheckServices=$value ;;
+		CheckSoftRAID) CheckSoftRAID=$value ;;
+		CheckDriveHealth) CheckDriveHealth=$value ;;
+		RunningProcesses) RunningProcesses=$value ;;
+		ConnectionPorts) ConnectionPorts=$value ;;
+		CollectEveryXSeconds) CollectEveryXSeconds=$value ;;
+		CustomVars) CustomVars=$value ;;
+	esac
+done < "$ScriptPath/hetrixtools.cfg"
 
-function servicestatus() {
-	# Check first via ps
-	if (( $(ps -ef | grep -v grep | grep $1 | wc -l) > 0 ))
-	then
-		# Up
-		echo "$(echo -ne "$1" | base64 | tr -d '[:space:]'),1"
+if [[ ! "$SID" =~ ^[[:xdigit:]]{32}$ ]]; then
+	printf '%s\n' 'Configure a valid HetrixTools SID in hetrixtools.cfg.' >&2
+	exit 1
+fi
+[[ "$CollectEveryXSeconds" =~ ^([2-9]|10)$ ]] || CollectEveryXSeconds=3
+
+encode() {
+	base64 | tr -d '[:space:]'
+}
+
+port_snapshot() {
+	# illumos uses a dot before the local port in both address families.
+	netstat -an -P tcp 2>/dev/null | awk '
+		$NF == "LISTEN" || $NF == "ESTABLISHED" {
+			host = port = $1
+			sub(/\.[^.]*$/, "", host)
+			sub(/^.*\./, "", port)
+			if (port !~ /^[0-9]+$/) next
+			if ($NF == "ESTABLISHED") connections[port]++
+			else if (host !~ /^(127\.|::1$|::ffff:127\.)/) listeners[port] = 1
+		}
+		END {
+			for (port in listeners) print "listen", port, 0
+			for (port in connections) print "established", port, connections[port]
+		}'
+}
+
+service_online() {
+	local state
+	if state=$(svcs -H -o state "$1" 2>/dev/null) && [[ -n "$state" ]]; then
+		grep -qx online <<< "$state"
+	elif [[ "$1" != svc:* ]]; then
+		pgrep -x "$1" >/dev/null 2>&1
 	else
-		# No systemctl, declare it down
-		echo "$(echo -ne "$1" | base64 | tr -d '[:space:]'),0"
+		return 1
 	fi
 }
 
-# Function used to prepare base64 str for url encoding
-function base64prep() {
-	str=$1
-	str="${str//+/%2B}"
-	str="${str//\//%2F}"
-	echo $str
+wire_name() {
+	printf '%s' "$1" | tr -d ',;'
 }
 
-# Kill any lingering agent processes (there shouldn't be any, the agent should finish its job within ~50 seconds, 
-# so when a new cycle starts there shouldn't be any lingering agents around, but just in case, so they won't stack)
-HTProcesses=$(ps -eo user=|sort|uniq -c | grep hetrixtools | awk -F " " '{print $1}')
-if [ -z "$HTProcesses" ]
-then
-	HTProcesses=0
-fi
-if [ "$HTProcesses" -gt 300 ]
-then
-	ps aux | grep -ie hetrixtools_agent.sh | awk '{print $2}' | xargs kill -9
-fi
-
-# Calculate how many times per minute should the data be collected (based on the `CollectEveryXSeconds` setting)
-RunTimes=$(($Runtime/$CollectEveryXSeconds))
-
-# Get starting minute
-M=$(echo `date +%M` | sed 's/^0*//')
-if [ -z "$M" ]
-then
-	M=0
-	# Clear the hetrixtools_cron.log every hour
-	rm -f $ScriptPath/hetrixtools_cron.log
-fi
-
-# Network interfaces
-if [ ! -z "$NetworkInterfaces" ]
-then
-	# Use the network interfaces specified in Settings
-	IFS=',' read -r -a NetworkInterfacesArray <<< "$NetworkInterfaces"
-else
-	# Automatically detect the network interfaces
-	NetworkInterfacesArray=($(ifconfig | grep BROADCAST | grep UP | awk '{print $1}' | awk -F ":" '{print $1}'))
-fi
-# Get the initial network usage
-START=$(date +%s)
-declare -A aRX
-declare -A aTX
-declare -A tRX
-declare -A tTX
-# Loop through network interfaces
-for NIC in "${NetworkInterfacesArray[@]}"
-do
-	aRX[$NIC]=$(dlstat -rpo rbytes "$NIC")
-	aTX[$NIC]=$(dlstat -tpo obytes "$NIC")
-done
-
-# Collect data loop
-for X in $(seq $RunTimes)
-do
-	# Get vmstat info
-	VMSTAT=$(vmstat $CollectEveryXSeconds 2 | tail -1)
-	# Get CPU Load
-	CPU=$(echo $[100-$( echo "$VMSTAT" | awk '{print $22}')])
-	tCPU=$(echo | awk "{ print $tCPU + $CPU }")
-	# Get IO Wait
-	IOW=$(iostat -xn $CollectEveryXSeconds 2 | grep zones | tail -1 | awk '{print $9}')
-	tIOW=$(echo | awk "{ print $tIOW + $IOW }")
-	# Get RAM Usage
-	bRAM=$(prtconf | grep Memory | awk '{print $3 * 1024}')
-	aRAM=$(($bRAM - $(echo "$VMSTAT" | awk '{print $5}')))
-	RAM=$(echo | awk "{ print $aRAM*100/$bRAM }" | sed 's/,/./g')
-	RAM=$(echo | awk "{ print 100 - $RAM }" | sed 's/,/./g')
-	tRAM=$(echo | awk "{ print $tRAM + $RAM }" | sed 's/,/./g')
-	# Get Network Usage
-	END=$(date +%s)
-	TIMEDIFF=$(echo | awk "{ print $END - $START }")
-	START=$(date +%s)
-		# Loop through network interfaces
-	for NIC in "${NetworkInterfacesArray[@]}"
-	do
-		# Received Traffic
-		RX=$(echo | awk "{ print $(dlstat -rpo rbytes "$NIC") - ${aRX[$NIC]} }")
-		RX=$(echo | awk "{ print $RX / $TIMEDIFF }")
-		RX=$(echo "$RX" | awk {'printf "%18.0f",$1'} | xargs)
-		aRX[$NIC]=$(dlstat -rpo rbytes "$NIC")
-		tRX[$NIC]=$(echo | awk "{ print ${tRX[$NIC]} + $RX }")
-		tRX[$NIC]=$(echo "${tRX[$NIC]}" | awk {'printf "%18.0f",$1'} | xargs)
-		# Transferred Traffic
-		TX=$(echo | awk "{ print $(dlstat -tpo obytes "$NIC") - ${aTX[$NIC]} }")
-		TX=$(echo | awk "{ print $TX / $TIMEDIFF }")
-		TX=$(echo "$TX" | awk {'printf "%18.0f",$1'} | xargs)
-		aTX[$NIC]=$(dlstat -tpo obytes "$NIC")
-		tTX[$NIC]=$(echo | awk "{ print ${tTX[$NIC]} + $TX }")
-		tTX[$NIC]=$(echo "${tTX[$NIC]}" | awk {'printf "%18.0f",$1'} | xargs)
-	done
-	# Check if minute changed, so we can end the loop
-	MM=$(echo `date +%M` | sed 's/^0*//')
-	if [ -z "$MM" ]
-	then
-		MM=0
-	fi
-	if [ "$MM" -gt "$M" ]
-	then
-		break
-	fi
-done
-
-# Get Operating System and Kernel
-OS="$(uname -s) $(uname -r)"
-OS=`echo -ne "$OS|$(uname -v)|0" | base64 | tr -d '[:space:]'`
-# Get the server uptime
-Uptime=$(($(date +%s) - $(kstat -pn system_misc -s boot_time|cut -f 2)))
-# Get CPU model
-CPUModel=$(psrinfo -pv | tail -n 1)
-CPUModel=$(echo -ne "$CPUModel" | base64 | tr -d '[:space:]')
-# Get CPU speed (MHz)
-CPUSpeed=$(psrinfo -pv | grep clock | tail -n 1 | awk '{print $(NF-1)}')
-CPUSpeed=$(echo -ne "$CPUSpeed" | base64 | tr -d '[:space:]')
-# Get number of cores
-CPUCores=$(psrinfo -t)
-# Calculate average CPU Usage
-CPU=$(echo | awk "{ print $tCPU / $X }")
-# Calculate IO Wait
-IOW=$(echo | awk "{ print $tIOW / $X }")
-# Get system memory (RAM)
-RAMSize=$(prtconf | grep Memory | awk '{print $3 * 1024}')
-# Calculate RAM Usage
-RAM=$(echo | awk "{ print $tRAM / $X }" | sed 's/,/./g')
-# Get the Swap Size
-SwapSize=$(swap -s | awk '{print $11}' | cut -d "k" -f 1)
-# Calculate Swap Usage
-SwapFree=$(($(echo $SwapSize) - $(swap -s | awk '{print $9}' | cut -d "k" -f 1)))
-Swap=$(echo | awk "{ print 100 - (($SwapFree / $SwapSize) * 100) }" | sed 's/,/./g')
-
-# Get all disks usage
-# DISKs=$(echo -ne $(df -k | awk '$1 ~ /\// {print}' | awk '{ print $(NF)","$2*1024","$3*1024","$4*1024";" }') | gzip -cf | base64 | tr -d '[:space:]')
-POOLs=$(zpool list -Ho name)
-for POOL in "$POOLs"
-do
-	DISKs="$DISKs$(zfs list -Hp $POOL | awk '{ print $(NF)","$2+$3","$2","$3";" }')"
-done
-DISKs=$(echo -ne $DISKs | gzip -cf | base64 | tr -d '[:space:]')
-DISKs=$(base64prep "$DISKs")
-
-# Calculate Total Network Usage (bytes)
-RX=0
-TX=0
-NICS=""
-for NIC in "${NetworkInterfacesArray[@]}"
-do
-	# Calculate individual NIC usage
-	RX=$(echo | awk "{ print ${tRX[$NIC]} / $X }")
-	RX=$(echo "$RX" | awk {'printf "%18.0f",$1'} | xargs)
-	TX=$(echo | awk "{ print ${tTX[$NIC]} / $X }")
-	TX=$(echo "$TX" | awk {'printf "%18.0f",$1'} | xargs)
-	NICS=$NICS"|"$NIC";"$RX";"$TX";"
-done
-NICS=$(echo -ne "$NICS" | gzip -cf | base64 | tr -d '[:space:]')
-NICS=$(base64prep "$NICS")
-# Check Services (if any are set to be checked)
-ServiceStatusString=""
-if [ ! -z "$CheckServices" ]
-then
-	IFS=',' read -r -a CheckServicesArray <<< "$CheckServices"
-	for i in "${CheckServicesArray[@]}"
-	do
-		ServiceStatusString="$ServiceStatusString"$(servicestatus "$i")";"
-	done
-fi
-
-# Check Software RAID
-RAID=""
-if [ "$CheckSoftRAID" -gt 0 ]
-then
-	for i in $(df -PB1 | awk '$1 ~ /\// {print}' | awk '{ print $1 }')
-	do
-		mdadm=$(mdadm -D $i)
-		if [ ! -z "$mdadm" ]
-		then
-			mnt=$(df -PB1 | grep $i | awk '{ print $(NF) }')
-			RAID="$RAID|$mnt;$i;$mdadm;"
+drive_health() {
+	local disk report model serial type
+	local -A seen_serials=()
+	command -v smartctl >/dev/null 2>&1 || return 0
+	while read -r disk; do
+		[[ "$disk" =~ ^[[:alnum:]_.-]+$ ]] || continue
+		# A failing disk can produce a nonzero exit status with useful output.
+		report=$(smartctl -i -H -A "/dev/rdsk/$disk" 2>/dev/null)
+		case "$report" in
+			*"SMART/Health Information (NVMe Log"*) type=2 ;;
+			*"Transport protocol:"*"SAS"*) type=3 ;;
+			*"SMART Attributes Data Structure"*) type=1 ;;
+			*) continue ;;
+		esac
+		model=$(awk -F ': *' '/^(Device Model|Model Number|Product):/ {print $2; exit}' <<< "$report")
+		serial=$(awk -F ': *' '/^[Ss]erial [Nn]umber:/ {print $2; exit}' <<< "$report")
+		if [[ -n "$serial" ]]; then
+			[[ -z "${seen_serials[$serial]}" ]] || continue
+			seen_serials[$serial]=1
 		fi
+		printf '%s,%s,%s,%s,%s;' "$type" "$disk" "$(printf '%s' "$report" | encode)" "$(wire_name "$model")" "$(wire_name "$serial")"
+	done < <(diskinfo -cH 2>/dev/null | awk '$1 !~ /\?\?R/ {print $2}')
+}
+
+if [[ -n "$NetworkInterfaces" ]]; then
+	IFS=, read -r -a interfaces <<< "$NetworkInterfaces"
+else
+	readarray -t interfaces < <(dladm show-link -p -o LINK,STATE 2>/dev/null | awk -F: '$2 == "up" {print $1}')
+fi
+declare -A rx_start tx_start
+for nic in "${interfaces[@]}"; do
+	[[ "$nic" =~ ^[[:alnum:]_.-]+$ ]] || continue
+	rx_start[$nic]=$(dlstat -rpo rbytes "$nic" 2>/dev/null)
+	tx_start[$nic]=$(dlstat -tpo obytes "$nic" 2>/dev/null)
+done
+
+if [[ -n "$ConnectionPorts" ]]; then
+	IFS=, read -r -a ports <<< "$ConnectionPorts"
+else
+	readarray -t ports < <(port_snapshot | awk '$1 == "listen" {print $2}' | sort -n | head -30)
+fi
+declare -A port_totals port_seen
+valid_ports=()
+for port in "${ports[@]}"; do
+	[[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+	port=$((10#$port))
+	[[ "$port" -ge 1 && "$port" -le 65535 && -z "${port_seen[$port]}" ]] || continue
+	port_seen[$port]=1
+	valid_ports+=("$port")
+	(( ${#valid_ports[@]} < 30 )) || break
+done
+readarray -t services < <(printf '%s\n' "$CheckServices" | tr ',' '\n' | awk '/^[[:alnum:]][[:alnum:]_.\/:-]*$/ && !seen[$0]++ && ++n <= 10')
+declare -A services_up
+ram_size=$(prtconf 2>/dev/null | awk '/Memory size:/ {printf "%.0f", $3 * 1024; exit}')
+start=$(date +%s)
+samples=$(( (48 - start % 60) / CollectEveryXSeconds ))
+(( samples > 0 )) || samples=1
+
+# The first zpool iostat report is since boot, so use the interval report.
+pool_names=$(zpool list -H -o name 2>/dev/null)
+if [[ -n "$pool_names" ]]; then
+	pool_interval=$((samples * CollectEveryXSeconds))
+	exec 3< <(zpool iostat -Hpy "$pool_interval" 1 2>/dev/null |
+		awk 'NF == 7 && $6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ {print $1, $6, $7}')
+fi
+
+sample_count=0
+cpu_user=0 cpu_system=0 free_ram=0
+while read -r cpu_u cpu_s free; do
+	(( sample_count += 1, cpu_user += cpu_u, cpu_system += cpu_s, free_ram += free ))
+	if (( ${#valid_ports[@]} )); then
+		while read -r kind port count; do
+			if [[ "$kind" == established && -n "${port_seen[$port]}" ]]; then
+				(( port_totals[$port] += count ))
+			fi
+		done < <(port_snapshot)
+	fi
+	for service in "${services[@]}"; do
+		if service_online "$service"; then services_up[$service]=1; fi
+	done
+# vmstat prints the since-boot report first, then us, sy and id at each interval.
+done < <(vmstat "$CollectEveryXSeconds" "$((samples + 1))" | awk '
+	NF >= 8 && $1 ~ /^[0-9]+$/ && $(NF-2) ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+		if (seen++) {print $(NF-2), $(NF-1), $5; fflush()}
+	}')
+elapsed=$(( $(date +%s) - start ))
+
+average() {
+	awk -v n="$sample_count" -v value="$1" 'BEGIN {if (n > 0) printf "%.2f", value/n}'
+}
+cpu=$(average "$((cpu_user + cpu_system))")
+cpu_us=$(average "$cpu_user")
+cpu_sy=$(average "$cpu_system")
+ram=$(awk -v n="$sample_count" -v size="$ram_size" -v free="$free_ram" '
+	BEGIN {if (n > 0 && size > 0) {used = 100 * (1 - free/n/size); printf "%.2f", (used > 0 ? used : 0)}}')
+read -r swap_size swap_used < <(swap -s 2>/dev/null | awk '
+	/used,.*available/ {
+		used = $9 + 0; available = $11 + 0; total = used + available
+		printf "%.0f %.2f\n", total, (total > 0 ? 100 * used / total : 0)
+	}')
+
+nics="" ipv4="" ipv6=""
+for nic in "${interfaces[@]}"; do
+	[[ "$nic" =~ ^[[:alnum:]_.-]+$ ]] || continue
+	rx=$(dlstat -rpo rbytes "$nic" 2>/dev/null)
+	tx=$(dlstat -tpo obytes "$nic" 2>/dev/null)
+	if (( elapsed > 0 )) && [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ &&
+		"${rx_start[$nic]}" =~ ^[0-9]+$ && "${tx_start[$nic]}" =~ ^[0-9]+$ ]]; then
+		nics+=$(awk -v nic="$nic" -v rx="$rx" -v tx="$tx" -v rx0="${rx_start[$nic]}" -v tx0="${tx_start[$nic]}" -v t="$elapsed" '
+			BEGIN {rx_rate = rx >= rx0 ? (rx-rx0)/t : 0; tx_rate = tx >= tx0 ? (tx-tx0)/t : 0; printf "%s,%.0f,%.0f;", nic, rx_rate, tx_rate}')
+	fi
+	addresses=$(ipadm show-addr -p -o ADDR "$nic/" 2>/dev/null)
+	ips=$(awk -F/ '$1 ~ /^[0-9]+\./ {printf ",%s", $1}' <<< "$addresses")
+	[[ -z "$ips" ]] || ipv4+="$nic$ips;"
+	ips=$(awk -F/ '{gsub(/\\:/, ":", $1)} $1 ~ /:/ && tolower($1) !~ /^fe[89ab]/ {printf ",%s", $1}' <<< "$addresses")
+	[[ -z "$ips" ]] || ipv6+="$nic$ips;"
+done
+
+conn="" serv=""
+if (( sample_count > 0 )); then
+	for port in "${valid_ports[@]}"; do
+		conn+=$(awk -v port="$port" -v value="${port_totals[$port]:-0}" -v n="$sample_count" 'BEGIN {printf "%s,%.0f;", port, value/n}')
 	done
 fi
-RAID=$(echo -ne "$RAID" | gzip -cf | base64 | tr -d '[:space:]')
-RAID=$(base64prep "$RAID")
+for service in "${services[@]}"; do
+	serv+="$service,${services_up[$service]:-0};"
+done
 
-# Check Drive Health
-DH=""
-if [ "$CheckDriveHealth" -gt 0 ]
-then
-	if [ -x "$(command -v smartctl)" ] #Using S.M.A.R.T. (for regular HDD/SSD)
-	then
-		for i in $(diskinfo -cH | grep -v "\?\?R" | awk '{ print $2 }')
-		do
-			DHealth=$(smartctl -A /dev/rdsk/$i)
-			if grep -q 'Attribute' <<< $DHealth
-			then
-				DHealth=$(smartctl -H /dev/rdsk/$i)"\n$DHealth"
-				DH="$DH|1\n$i\n$DHealth\n"
-			fi
-		done
-	fi
-	if [ -x "$(command -v nvme)" ] #Using nvme-cli (for NVMe)
-	then
-		for i in $(lsblk -l | grep 'disk' | awk '{ print $1 }')
-		do
-			DHealth=$(nvme smart-log /dev/$i)
-			if grep -q 'NVME' <<< $DHealth
-			then
-				if [ -x "$(command -v smartctl)" ]
-				then
-					DHealth=$(smartctl -H /dev/${i%??})"\n$DHealth"
-				fi
-				DH="$DH|2\n$i\n$DHealth\n"
-			fi
-		done
-	fi
+disks=$(zfs list -Hp -t filesystem -o name,used,available,mountpoint 2>/dev/null | awk -F '\t' '
+	{mount = $4 ~ /^\// ? $4 : $1; gsub(/[,;]/, "", mount); printf "%s,zfs,%.0f,%s,%s;", mount, $2+$3, $2, $3}')
+declare -A mounts
+while IFS=$'\t' read -r name mount; do
+	[[ -n "$name" ]] || continue
+	[[ "$mount" == /* ]] || mount=$name
+	mounts[$name]=$(wire_name "$mount")
+done < <(zfs list -Hp -t filesystem -o name,mountpoint 2>/dev/null)
+iops="" zp=""
+if [[ -n "$pool_names" ]]; then
+	while read -r -t 3 pool read_rate write_rate <&3; do
+		iops+="${mounts[$pool]:-$pool},$read_rate,$write_rate;"
+	done
+	exec 3<&-
 fi
-DH=$(echo -ne "$DH" | gzip -cf | base64 | tr -d '[:space:]')
-DH=$(base64prep "$DH")
+if [[ "$CheckSoftRAID" == 1 && -n "$pool_names" ]]; then
+	while read -r pool; do
+		status=$(zpool status "$pool" 2>/dev/null) || continue
+		zp+="${mounts[$pool]:-$pool},$pool,$(printf '%s' "$status" | encode);"
+	done <<< "$pool_names"
+fi
+dh=""
+[[ "$CheckDriveHealth" != 1 ]] || dh=$(drive_health)
 
-# Running Processes
-RPS1=""
-RPS2=""
-if [ "$RunningProcesses" -gt 0 ]
-then
-	# Get initial 'running processes' snapshot, saved from last run
-	RPS1=$(cat $ScriptPath/running_proc.txt)
-	# Get the current 'running processes' snapshot
-	RPS2=$(ps -Ao pid,ppid,uid,user:20,pcpu,pmem,cputime,etime,comm,cmd --no-headers)
-	RPS2=$(echo -ne "$RPS2" | gzip -cf | base64 | tr -d '[:space:]')
-	RPS2=$(base64prep "$RPS2")
-	# Save the current snapshot for next run
-	echo $RPS2 > $ScriptPath/running_proc.txt
+custom=""
+if [[ "$CustomVars" =~ ^[[:alnum:]_][[:alnum:]_.-]*\.json$ &&
+	-f "$ScriptPath/$CustomVars" && ! -L "$ScriptPath/$CustomVars" ]]; then
+	custom=$(encode < "$ScriptPath/$CustomVars")
+fi
+rps1="" rps2=""
+if [[ "$RunningProcesses" == 1 ]]; then
+	if [[ -f "$StatePath/running_proc.txt" && ! -L "$StatePath/running_proc.txt" ]]; then
+		read -r rps1 < "$StatePath/running_proc.txt"
+		[[ "$rps1" =~ ^[A-Za-z0-9+/=]*$ && "$rps1" != H4sI* ]] || rps1=""
+	fi
+	rps2=$(ps -e -o pid=,ppid=,uid=,user=,pcpu=,pmem=,time=,etime=,comm=,args= | encode)
+	snapshot=$(mktemp "$StatePath/running_proc.XXXXXX") || exit 1
+	printf '%s\n' "$rps2" > "$snapshot" && mv -f "$snapshot" "$StatePath/running_proc.txt"
 fi
 
-# Prepare data
-DATA="$OS|$Uptime|$CPUModel|$CPUSpeed|$CPUCores|$CPU|$IOW|$RAMSize|$RAM|$SwapSize|$Swap|$DISKs|$NICS|$ServiceStatusString|$RAID|$DH|$RPS1|$RPS2"
-POST="v=$VERSION&s=$SID&d=$DATA"
+boot=$(kstat -pn system_misc -s boot_time 2>/dev/null | awk 'NR == 1 {print $2}')
+uptime_seconds=""
+[[ ! "$boot" =~ ^[0-9]+$ ]] || uptime_seconds=$((start - boot))
+cpu_model=$(psrinfo -pv 2>/dev/null | awk 'NF {line=$0} END {sub(/^[[:space:]]+/, "", line); print line}')
+cpu_speed=$(psrinfo -v 2>/dev/null | awk '/operates at .* MHz/ && !seen++ {for (i=2; i<=NF; i++) if ($i == "MHz") {printf "%.0f", $(i-1); break}}')
+cpu_cores=$(psrinfo 2>/dev/null | awk 'END {print NR}')
+cpu_sockets=$(psrinfo -p 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')
+read -r load1 load5 load15 < <(uptime | awk -F 'load averages?: ' '{gsub(/,/, "", $2); split($2, values, " "); for (i=1; i<=3; i++) if (values[i] !~ /^[0-9]+([.][0-9]+)?$/) exit; print $2}')
 
-# Save data to file
-echo $POST > $ScriptPath/hetrixtools_agent.log
+# Match the upstream v2 field names and encodings. A command that yields no
+# supported measurement leaves its field empty.
+wire=()
+metric() {
+	wire+=("\"$1\":\"$2\"")
+}
+text_metric() {
+	metric "$1" "$(printf '%s' "$2" | encode)"
+}
+metric version "$VERSION"
+metric SID "$SID"
+metric agent 0
+metric user "$(id -un | tr -cd '[:alnum:]_.-')"
+text_metric os "SmartOS $(uname -v)"
+text_metric kernel "$(uname -r)"
+text_metric hostname "$(uname -n)"
+text_metric time "$(date '+%Y-%m-%d %T %Z')"
+metric uptime "$uptime_seconds"
+text_metric cpumodel "$cpu_model"
+metric cpusockets "$cpu_sockets"
+metric cpucores "$cpu_cores"
+metric cpuspeed "$cpu_speed"
+metric cpu "$cpu"
+metric us "$cpu_us"
+metric sy "$cpu_sy"
+metric load1 "$load1"
+metric load5 "$load5"
+metric load15 "$load15"
+metric ramsize "$ram_size"
+metric ram "$ram"
+metric ramswapsize "$swap_size"
+metric ramswap "$swap_used"
+text_metric disks "$disks"
+text_metric iops "$iops"
+text_metric zp "$zp"
+text_metric dh "$dh"
+text_metric nics "$nics"
+text_metric ipv4 "$ipv4"
+text_metric ipv6 "$ipv6"
+text_metric conn "$conn"
+text_metric serv "$serv"
+metric cust "$custom"
+metric rps1 "$rps1"
+metric rps2 "$rps2"
+for field in reqreboot cputhreads wa st rambuff ramcache inodes raid temp oping; do
+	metric "$field" ""
+done
 
-# Post data
-wget -t 1 -T 30 -qO- --post-file="$ScriptPath/hetrixtools_agent.log" --no-check-certificate https://sm.hetrixtools.net/ &> /dev/null
+set -o pipefail
+payload=$(IFS=,; printf '{%s}' "${wire[*]}" | gzip -c | encode) || exit 1
+payload=${payload//+/%2B}
+payload=${payload//\//%2F}
+body=$(mktemp "$StatePath/payload.XXXXXX") || exit 1
+trap 'rm -f "$body"' EXIT
+printf 'j=%s\n' "$payload" > "$body" || exit 1
+wget -t 1 -T 8 -qO- --post-file="$body" https://sm.hetrixtools.net/v2/ >/dev/null
