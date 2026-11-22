@@ -20,136 +20,91 @@
 #
 
 # Set PATH
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Install or update from a local checkout of the SmartOS fork.
+set -e
+PATH=/usr/bin:/usr/sbin:/opt/local/bin:/opt/local/sbin:/opt/tools/bin:/opt/tools/sbin
+export LC_ALL=C
+umask 077
+if [[ "$EUID" != 0 || "$(uname -s)" != SunOS ]]; then
+	printf '%s\n' 'Run this script as root on SmartOS.' >&2
+	exit 1
+fi
+for tool in bash wget vmstat dladm dlstat ipadm zfs zpool; do
+	command -v "$tool" >/dev/null || { printf 'Missing command: %s\n' "$tool" >&2; exit 1; }
+done
 
-# Old Agent Path
-AGENT="/etc/hetrixtools/hetrixtools_agent.sh"
-
-# Check if user specified version to update to
-if [ -z "$1" ]
-then
-	VERS="master"
+source_dir=$(cd -P -- "$(dirname -- "$0")" && pwd)
+agent_dir=/etc/hetrixtools
+agent=$agent_dir/hetrixtools_agent.sh
+config=$agent_dir/hetrixtools.cfg
+state=$agent_dir/state
+run_user=root
+install=0
+if [[ "$1" == --install ]]; then
+	install=1
+	shift
+	if [[ ! "$1" =~ ^[[:xdigit:]]{32}$ || ! "$2" =~ ^[01]$ || ( -n "$3" && ! "$3" =~ ^[[:alnum:]_/.,:-]+$ ) ||
+		! "${4:-0}${5:-0}${6:-0}" =~ ^[01]{3}$ ]]; then
+		printf '%s\n' 'Usage: bash hetrixtools_install.sh SID 0|1 [services] [check_zfs] [drive_health] [processes]' >&2
+		exit 1
+	fi
+	if [[ "$2" == 0 ]]; then
+		run_user=hetrixtools
+		id -u "$run_user" >/dev/null 2>&1 || useradd -d "$agent_dir" -s /bin/false "$run_user"
+	fi
 else
-	VERS=$1
+	[[ -f "$agent" ]] || { printf '%s\n' 'No existing SmartOS agent found.' >&2; exit 1; }
+	if id -u hetrixtools >/dev/null 2>&1 &&
+		crontab -u hetrixtools -l 2>/dev/null | grep -q '/etc/hetrixtools/hetrixtools_agent.sh'; then
+		run_user=hetrixtools
+	fi
 fi
 
-# Check if install script is run by root
-echo "Checking root privileges..."
-if [ "$EUID" -ne 0 ]
-  then echo "ERROR: Please run the install script as root."
-  exit
-fi
-echo "... done."
+bash -n "$source_dir/hetrixtools_agent.sh"
+# The agent code and configuration remain root-owned even for unprivileged cron.
+# Give the selected account a private directory for transient payloads and snapshots.
+mkdir -p "$agent_dir"
+[[ ! -L "$agent_dir" && ! -L "$state" ]] || exit 1
+chown root "$agent_dir"
+chmod 755 "$agent_dir"
+mkdir -p "$state"
+chown "$run_user" "$state"
+chmod 700 "$state"
 
-# Check if system has crontab and wget
-echo "Checking for crontab and wget..."
-command -v crontab >/dev/null 2>&1 || { echo "ERROR: Crontab is required to run this agent." >&2; exit 1; }
-command -v wget >/dev/null 2>&1 || { echo "ERROR: wget is required to run this agent." >&2; exit 1; }
-echo "... done."
-
-# Look for the old agent
-echo "Looking for the old agent..."
-if [ -f "$AGENT" ]
-then
-	echo "... done."
+stage=$(mktemp -d "$agent_dir/.update.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+if (( install )); then
+	{
+		printf 'SID=%s\n' "$1"
+		if [[ "$3" != 0 ]]; then printf 'CheckServices=%s\n' "$3"; fi
+		printf 'CheckSoftRAID=%s\nCheckDriveHealth=%s\nRunningProcesses=%s\n' "${4:-0}" "${5:-0}" "${6:-0}"
+	} > "$stage/config"
+elif [[ -f "$config" ]]; then
+	cp "$config" "$stage/config"
 else
-	echo "ERROR: No old agent found. Nothing to update." >&2; exit 1;
+	# Copy only literal, known assignments from the previous agent.
+	awk '/^(SID|NetworkInterfaces|CheckServices|CheckSoftRAID|CheckDriveHealth|RunningProcesses|ConnectionPorts|CollectEveryXSeconds|CustomVars)=/{print}' "$agent" > "$stage/config"
 fi
-
-# Extract data from the old agent
-echo "Extracting configs from the old agent..."
-# SID (Server ID)
-SID=$(grep 'SID="' $AGENT | awk -F'"' '{ print $2 }')
-# Network Interfaces
-NetworkInterfaces=$(grep 'NetworkInterfaces="' $AGENT | awk -F'"' '{ print $2 }')
-# Check Services
-CheckServices=$(grep 'CheckServices="' $AGENT | awk -F'"' '{ print $2 }')
-# Check Software RAID Health
-CheckSoftRAID=$(grep 'CheckSoftRAID=' $AGENT | awk -F'=' '{ print $2 }')
-# Check Drive Health
-CheckDriveHealth=$(grep 'CheckDriveHealth=' $AGENT | awk -F'=' '{ print $2 }')
-# RunningProcesses
-RunningProcesses=$(grep 'RunningProcesses=' $AGENT | awk -F'=' '{ print $2 }')
-if [ -z "$RunningProcesses" ]
-then
-	RunningProcesses=0
+if ! awk -F= '$1 == "SID" {sid=$2; gsub(/^"|"$/, "", sid)} END {exit !(length(sid) == 32 && sid ~ /^[[:xdigit:]]+$/)}' "$stage/config"; then
+	printf '%s\n' 'The existing configuration has no valid SID.' >&2
+	exit 1
 fi
-echo "... done."
+chgrp "$(id -gn "$run_user")" "$stage/config"
+chmod 640 "$stage/config"
+cp "$source_dir/hetrixtools_agent.sh" "$stage/agent"
+chmod 755 "$stage/agent"
+mv -f "$stage/config" "$config"
+mv -f "$stage/agent" "$agent"
 
-# Fetching new agent
-echo "Fetching the new agent..."
-wget -t 1 -T 30 -qO $AGENT --no-check-certificate https://raw.github.com/hetrixtools/agent/$VERS/hetrixtools_agent.sh
-echo "... done."
-
-# Inserting Server ID (SID) into the agent config
-echo "Inserting Server ID (SID) into agent config..."
-sed -i "s/SIDPLACEHOLDER/$SID/" $AGENT
-echo "... done."
-
-# Check if any network interfaces are specified
-echo "Checking if any network interfaces are specified..."
-if [ ! -z "$NetworkInterfaces" ]
-then
-	echo "Network interfaces found, inserting them into the agent config..."
-	sed -i "s/NetworkInterfaces=\"\"/NetworkInterfaces=\"$NetworkInterfaces\"/" $AGENT
+if (( install )); then
+	for account in root hetrixtools; do
+		id -u "$account" >/dev/null 2>&1 || continue
+		{ crontab -u "$account" -l 2>/dev/null || :; } |
+			awk '!/\/etc\/hetrixtools\/hetrixtools_agent\.sh/' > "$stage/cron"
+		if [[ "$account" == "$run_user" ]]; then
+			printf '* * * * * %s %s\n' "$(command -v bash)" "$agent" >> "$stage/cron"
+		fi
+		crontab -u "$account" "$stage/cron"
+	done
 fi
-
-# Check if any services are to be monitored
-echo "Checking if any services should be monitored..."
-if [ ! -z "$CheckServices" ]
-then
-	echo "Services found, inserting them into the agent config..."
-	sed -i "s/CheckServices=\"\"/CheckServices=\"$CheckServices\"/" $AGENT
-fi
-echo "... done."
-
-# Check if Software RAID should be monitored
-echo "Checking if software RAID should be monitored..."
-if [ "$CheckSoftRAID" -eq "1" ]
-then
-	echo "Enabling software RAID monitoring in the agent config..."
-	sed -i "s/CheckSoftRAID=0/CheckSoftRAID=1/" $AGENT
-fi
-echo "... done."
-
-# Check if Drive Health should be monitored
-echo "Checking if Drive Health should be monitored..."
-if [ "$CheckDriveHealth" -eq "1" ]
-then
-	echo "Enabling Drive Health monitoring in the agent config..."
-	sed -i "s/CheckDriveHealth=0/CheckDriveHealth=1/" $AGENT
-fi
-echo "... done."
-
-# Check if 'View running processes' should be enabled
-echo "Checking if 'View running processes' should be enabled..."
-if [ "$RunningProcesses" -eq "1" ]
-then
-	echo "Enabling 'View running processes' in the agent config..."
-	sed -i "s/RunningProcesses=0/RunningProcesses=1/" $AGENT
-fi
-echo "... done."
-
-# Killing any running hetrixtools agents
-echo "Making sure no hetrixtools agent scripts are currently running..."
-ps aux | grep -ie hetrixtools_agent.sh | awk '{print $2}' | xargs kill -9
-echo "... done."
-
-# Assign permissions
-echo "Assigning permissions for the hetrixtools user..."
-if id -u hetrixtools >/dev/null 2>&1
-then
-	chown -R hetrixtools:hetrixtools /etc/hetrixtools
-	chmod -R 700 /etc/hetrixtools
-fi
-
-# Cleaning up install file
-echo "Cleaning up the update file..."
-if [ -f $0 ]
-then
-    rm -f $0
-fi
-echo "... done."
-
-# All done
-echo "HetrixTools agent update completed. It can take up to two (2) minutes for new data to be collected."
+printf '%s\n' "HetrixTools agent ready for $run_user's cron job."
